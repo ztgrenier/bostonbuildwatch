@@ -5,17 +5,21 @@ from datetime import datetime
 from io import BytesIO
 
 # -----------------------
-# CONFIG — change per script
+# CONFIG
 # -----------------------
 S3_BUCKET = "boston-buildwatch"
-S3_PREFIX = "boston-code-enforcement-dpw-violations/"    # Change per dataset
-DATE_COLUMN = "status_dttm"       # Change per dataset
-FILENAME_REGEX = r"Boston Buildwatch - Boston - (\d{4}-\d{2}-\d{2}) - Code Enforcement DPW Violations\.csv"  # Change per dataset
+S3_PREFIX = "boston-code-enforcement-dpw-violations/"
+DATE_COLUMN = "status_dttm"
+FILENAME_REGEX = r"Boston Buildwatch - Boston - (\d{4}-\d{2}-\d{2}) - Code Enforcement DPW Violations\.csv"
+
+DELETE_START_ROW = 2
+DELETE_END_ROW = 495_000
+DATE_FORMAT = "%Y/%m/%d"
 
 s3 = boto3.client("s3")
 
 # -----------------------
-# Get the most recent CSV based on YYYY-MM-DD in filename
+# Get latest CSV
 # -----------------------
 def get_latest_csv_key():
     resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PREFIX)
@@ -39,20 +43,25 @@ def get_latest_csv_key():
 def lambda_handler(event, context):
     key = get_latest_csv_key()
 
-    # --- Stream CSV from S3 into pandas ---
+    # --- Read entire CSV into memory ---
     obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
     df = pd.read_csv(obj["Body"], low_memory=False)
 
-    # --- Convert column to datetime, remove time portion ---
-    df[DATE_COLUMN] = pd.to_datetime(df[DATE_COLUMN], errors="coerce").dt.date
+    # --- Convert date column to datetime and format as YYYY/MM/DD ---
+    df[DATE_COLUMN] = pd.to_datetime(df[DATE_COLUMN], errors="coerce")
+    df.loc[:, DATE_COLUMN] = df[DATE_COLUMN].dt.strftime(DATE_FORMAT)
 
-    # --- Sort old → new ---
-    df = df.sort_values(DATE_COLUMN)
+    # --- Sort by the datetime version (still need datetime to sort correctly) ---
+    df_sorted = df.copy()
+    df_sorted['_sort_date'] = pd.to_datetime(df_sorted[DATE_COLUMN], errors="coerce")
+    df_sorted = df_sorted.sort_values(by='_sort_date', na_position='last').drop(columns=['_sort_date']).reset_index(drop=True)
 
-    # --- Stream back to S3 ---
+    # --- Delete row range (1-based) ---
+    df_sorted = df_sorted.drop(df_sorted.index[DELETE_START_ROW-1 : DELETE_END_ROW])
+
+    # --- Write back to S3 ---
     buffer = BytesIO()
-    # to_csv will store dates in Excel-native MM/DD/YYYY format automatically
-    df.to_csv(buffer, index=False, date_format="%m/%d/%Y")
+    df_sorted.to_csv(buffer, index=False)
     buffer.seek(0)
 
     s3.put_object(
@@ -64,5 +73,5 @@ def lambda_handler(event, context):
 
     return {
         "statusCode": 200,
-        "body": f"Processed {len(df)} rows in {key}"
+        "body": f"Formatted dates, sorted by {DATE_COLUMN}, deleted rows {DELETE_START_ROW}-{DELETE_END_ROW}, final rows: {len(df_sorted)}"
     }
