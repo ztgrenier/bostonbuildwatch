@@ -1,0 +1,89 @@
+import json
+import csv
+import io
+import urllib.request
+import boto3
+from datetime import date
+
+# CKAN dataset resource ID
+RESOURCE_ID = "0f0fa8c2-87ba-45d6-a876-0d177dd02512"
+CKAN_URL = "https://data.boston.gov/api/3/action/datastore_search"
+
+# S3 LOCATION
+S3_BUCKET = "boston-buildwatch"
+S3_PREFIX = "boston-zba-appeals/"
+
+s3 = boto3.client("s3")
+
+def fetch_all_rows():
+    rows = []
+    offset = 0
+    limit = 500  # CKAN safe limit per request
+
+    while True:
+        url = f"{CKAN_URL}?resource_id={RESOURCE_ID}&limit={limit}&offset={offset}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "AWS Lambda",
+                "Accept": "application/json"
+            }
+        )
+
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read())
+
+        records = data["result"]["records"]
+        if not records:
+            break
+
+        rows.extend(records)
+        offset += limit
+
+    return rows
+
+def lambda_handler(event, context):
+    try:
+        rows = fetch_all_rows()
+
+        if not rows:
+            raise Exception("No rows returned from CKAN API")
+
+        # Build CSV in memory
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+        csv_bytes = output.getvalue().encode("utf-8")
+
+        # Build date-based filename
+        today_str = date.today().strftime("%Y-%m-%d")
+        s3_key = (
+            f"{S3_PREFIX}"
+            f"Boston Buildwatch - Boston - {today_str} - ZBA Appeals.csv"
+        )
+
+        # Upload to S3
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=csv_bytes,
+            ContentType="text/csv"
+        )
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "CSV successfully fetched via CKAN API and uploaded to S3",
+                "rows": len(rows),
+                "bucket": S3_BUCKET,
+                "key": s3_key
+            })
+        }
+
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
