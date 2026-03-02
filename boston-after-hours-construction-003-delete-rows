@@ -1,0 +1,104 @@
+import boto3
+import pandas as pd
+from io import BytesIO
+from datetime import datetime, timedelta
+import re
+import tempfile
+
+# -----------------------
+# CONFIG
+# -----------------------
+S3_BUCKET = "boston-buildwatch"
+S3_PREFIX = "boston-after-hours-construction/"    # Change per dataset
+DATE_COLUMN = "start_datetime"       # Change per dataset
+FILENAME_REGEX = r"Boston Buildwatch - Boston - (\d{4}-\d{2}-\d{2}) - After Hours Construction\.csv"  # Change per dataset
+
+YEARS_TO_KEEP = 3
+CHUNK_SIZE = 5000
+
+DATE_FORMAT = "%Y-%m-%d"
+# -----------------------
+
+
+def lambda_handler(event, context):
+    s3 = boto3.client("s3")
+
+    cutoff_date = datetime.now() - timedelta(days=YEARS_TO_KEEP * 365)
+
+    # --- Find most recent dated file using regex ---
+    paginator = s3.get_paginator("list_objects_v2")
+    pages = paginator.paginate(
+        Bucket=S3_BUCKET,
+        Prefix=S3_PREFIX
+    )
+
+    dated_files = []
+
+    for page in pages:
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            filename = key.split("/")[-1]
+
+            match = re.match(FILENAME_REGEX, filename)
+            if match:
+                file_date = datetime.strptime(match.group(1), DATE_FORMAT)
+                dated_files.append((file_date, key))
+
+    if not dated_files:
+        raise Exception("No matching dated CSV files found.")
+
+    latest_date, file_key = max(dated_files, key=lambda x: x[0])
+
+    # --- Stream CSV from S3 ---
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=file_key)
+    csv_stream = BytesIO(obj["Body"].read())
+
+    chunks = pd.read_csv(csv_stream, chunksize=CHUNK_SIZE)
+
+    total_rows = 0
+    deleted_rows = 0
+    header_written = False
+
+    # --- Temp file for filtered output ---
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmp_file:
+        tmp_filename = tmp_file.name
+
+        for chunk in chunks:
+            total_rows += len(chunk)
+
+            chunk[DATE_COLUMN] = pd.to_datetime(
+                chunk[DATE_COLUMN].astype(str).str[:10],
+                errors="coerce"
+            )
+
+            keep_mask = chunk[DATE_COLUMN] >= cutoff_date
+            deleted_rows += (~keep_mask).sum()
+
+            filtered_chunk = chunk[keep_mask]
+
+            if not filtered_chunk.empty:
+                filtered_chunk.to_csv(
+                    tmp_file,
+                    index=False,
+                    header=not header_written,
+                    mode="a"
+                )
+                header_written = True
+
+    # --- Upload filtered CSV back to SAME key ---
+    with open(tmp_filename, "rb") as f:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=file_key,
+            Body=f,
+            ContentType="text/csv"
+        )
+
+    return {
+        "statusCode": 200,
+        "body": (
+            f"Deleted {deleted_rows} rows older than {YEARS_TO_KEEP} years. "
+            f"Kept {total_rows - deleted_rows} rows. "
+            f"File: {file_key}"
+        )
+    }
