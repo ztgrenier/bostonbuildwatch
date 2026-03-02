@@ -1,0 +1,42 @@
+import json
+import boto3
+import requests
+from datetime import datetime
+
+def lambda_handler(event, context):
+    # API URL to fetch the metadata of the dataset
+    api_url = 'https://data.boston.gov/api/3/action/resource_show?id=6ddcd912-32a0-43df-9908-63574f8c7e77'
+
+    try:
+        # Fetch metadata from the API
+        response = requests.get(api_url)
+        response.raise_for_status()
+        data = response.json()
+
+        # Extract CSV URL from the API response
+        csv_url = data['result']['url']
+        
+        # Build filename with current date (YYYY-MM-DD)
+        today = datetime.utcnow().strftime('%Y-%m-%d')
+        file_name = f"Boston Buildwatch - Boston - {today} - Approved Building Permits.csv"
+        
+        # S3 bucket + folder (prefix)
+        s3_bucket_name = 'boston-buildwatch'
+        s3_folder = 'boston-approved-building-permits'
+        s3_key = f"{s3_folder}/{file_name}"
+        
+        # Initialize S3 client
+        s3_client = boto3.client('s3')
+        
+        # Stream the download and upload to S3
+        with requests.get(csv_url, stream=True) as response:
+            response.raise_for_status()
+            s3_client.upload_fileobj(response.raw, s3_bucket_name, s3_key)
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps(f"File uploaded successfully as {s3_key}")
+        }
+
+    except Exception as e:
+        raise Exception(f"Failed to download or upload file: {str(e)}")
