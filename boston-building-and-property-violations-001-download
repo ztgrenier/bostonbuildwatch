@@ -1,0 +1,72 @@
+import boto3
+import requests
+from datetime import datetime
+
+s3 = boto3.client("s3")
+
+BUCKET = "boston-buildwatch"
+FOLDER = "boston-building-and-property-violations"
+CSV_URL = "https://data.boston.gov/dataset/705244a6-70a6-4ff8-ab8e-56441aff18e7/resource/800a2663-1d6a-46e7-9356-bedb70f5332c/download/tmpb8a5csjk.csv"  # <-- Replace with your new CSV URL
+
+def lambda_handler(event, context):
+    # Get today's date
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    filename = f"Boston Buildwatch - Boston - {today_str} - Building and Property Violations.csv"
+    key = f"{FOLDER}/{filename}"
+
+    # Stream download
+    with requests.get(CSV_URL, stream=True) as r:
+        r.raise_for_status()
+        # Multipart upload to S3 in chunks
+        mp = s3.create_multipart_upload(Bucket=BUCKET, Key=key, ContentType="text/csv")
+        upload_id = mp["UploadId"]
+        parts = []
+        part_number = 1
+        chunk_size = 5 * 1024 * 1024  # 5 MB
+        buffer = bytearray()
+
+        try:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    buffer.extend(chunk)
+                    if len(buffer) >= chunk_size:
+                        part = s3.upload_part(
+                            Bucket=BUCKET,
+                            Key=key,
+                            UploadId=upload_id,
+                            PartNumber=part_number,
+                            Body=bytes(buffer)
+                        )
+                        parts.append({"ETag": part["ETag"], "PartNumber": part_number})
+                        part_number += 1
+                        buffer.clear()
+
+            # Upload remaining buffer
+            if buffer:
+                part = s3.upload_part(
+                    Bucket=BUCKET,
+                    Key=key,
+                    UploadId=upload_id,
+                    PartNumber=part_number,
+                    Body=bytes(buffer)
+                )
+                parts.append({"ETag": part["ETag"], "PartNumber": part_number})
+
+            # Complete multipart upload
+            s3.complete_multipart_upload(
+                Bucket=BUCKET,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts}
+            )
+
+            return {
+                "status": "success",
+                "file": f"s3://{BUCKET}/{key}",
+                "multipart_parts": len(parts)
+            }
+
+        except Exception as e:
+            # Abort if anything fails
+            s3.abort_multipart_upload(Bucket=BUCKET, Key=key, UploadId=upload_id)
+            raise e
