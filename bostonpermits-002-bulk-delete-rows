@@ -1,0 +1,81 @@
+import boto3
+import pandas as pd
+from io import BytesIO
+from datetime import datetime
+import re
+
+def lambda_handler(event, context):
+    s3_bucket = 'boston-buildwatch'
+    s3_prefix = 'boston-approved-building-permits/'
+    required_substring = 'Approved Building Permits.csv'
+    
+    s3 = boto3.client('s3')
+
+    # Use paginator so this never breaks at 1000+ files
+    paginator = s3.get_paginator('list_objects_v2')
+    pages = paginator.paginate(
+        Bucket=s3_bucket,
+        Prefix=s3_prefix
+    )
+
+    dated_files = []
+
+    for page in pages:
+        if 'Contents' not in page:
+            continue
+
+        for obj in page['Contents']:
+            key = obj['Key']
+
+            if required_substring not in key:
+                continue
+
+            # Extract YYYY-MM-DD from filename
+            match = re.search(r'\d{4}-\d{2}-\d{2}', key)
+            if not match:
+                continue
+
+            file_date = datetime.strptime(match.group(), '%Y-%m-%d')
+            dated_files.append((file_date, key))
+
+    if not dated_files:
+        raise Exception('No dated Approved Building Permits files found.')
+
+    # Pick most recent file
+    latest_date, file_key = max(dated_files, key=lambda x: x[0])
+
+    # Read CSV from S3
+    obj = s3.get_object(Bucket=s3_bucket, Key=file_key)
+    csv_data = obj['Body'].read()
+
+    df = pd.read_csv(BytesIO(csv_data))
+    original_row_count = len(df)
+
+    # Sort by issued_date
+    df.sort_values(by='issued_date', inplace=True)
+
+    # Keep row 1 (index 0) and rows 500001+
+    df = pd.concat([
+        df.iloc[[0]],        # row 1
+        df.iloc[500000:]     # rows beyond 500000
+    ])
+
+    deleted_rows = original_row_count - len(df)
+
+    modified_csv = df.to_csv(index=False)
+
+    # Write back to SAME file in SAME folder
+    s3.put_object(
+        Bucket=s3_bucket,
+        Key=file_key,
+        Body=modified_csv,
+        ContentType='text/csv'
+    )
+
+    return {
+        'statusCode': 200,
+        'body': (
+            f'Processed file dated {latest_date.date()}: {file_key}. '
+            f'Deleted {deleted_rows} rows.'
+        )
+    }
