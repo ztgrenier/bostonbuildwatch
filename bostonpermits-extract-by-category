@@ -1,0 +1,104 @@
+import boto3
+import pandas as pd
+import io
+import os
+import re
+from datetime import datetime
+
+s3 = boto3.client('s3')
+
+BUCKET = 'boston-buildwatch'
+PREFIX = 'boston-approved-building-permits/'
+OUTPUT_PREFIX = 'boston-approved-building-permits/'
+
+def clean_filename(value):
+    value = str(value).strip()
+    value = re.sub(r'[^\w\s-]', '', value)
+    value = re.sub(r'\s+', '_', value)
+    return value[:100]
+
+def get_latest_file_key():
+    """
+    Find the latest CSV file in S3 based on date in filename
+    المتوقع format:
+    Boston Buildwatch - Boston - YYYY-MM-DD - Approved Building Permits.csv
+    """
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+    if 'Contents' not in response:
+        raise Exception("No files found in S3 prefix")
+
+    latest_key = None
+    latest_date = None
+
+    for obj in response['Contents']:
+        key = obj['Key']
+
+        if not key.endswith('.csv'):
+            continue
+
+        # Extract date using regex
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', key)
+        if not match:
+            continue
+
+        file_date = datetime.strptime(match.group(1), "%Y-%m-%d")
+
+        if latest_date is None or file_date > latest_date:
+            latest_date = file_date
+            latest_key = key
+
+    if not latest_key:
+        raise Exception("No valid dated CSV files found")
+
+    print(f"Using latest file: {latest_key}")
+    return latest_key
+
+def lambda_handler(event, context):
+    try:
+        # ✅ Get latest file dynamically
+        KEY = get_latest_file_key()
+
+        # 1. Read CSV from S3
+        response = s3.get_object(Bucket=BUCKET, Key=KEY)
+        csv_content = response['Body'].read()
+
+        df = pd.read_csv(io.BytesIO(csv_content))
+
+        if 'Permit Description' not in df.columns:
+            raise Exception("Column 'Permit Description' not found")
+
+        categories = df['Permit Description'].dropna().unique()
+        print(f"Found {len(categories)} categories")
+
+        base_filename = os.path.basename(KEY).replace('.csv', '')
+
+        for category in categories:
+            filtered_df = df[df['Permit Description'] == category]
+            clean_category = clean_filename(category)
+
+            output_key = f"{OUTPUT_PREFIX}{base_filename}_{clean_category}.csv"
+
+            csv_buffer = io.StringIO()
+            filtered_df.to_csv(csv_buffer, index=False)
+
+            s3.put_object(
+                Bucket=BUCKET,
+                Key=output_key,
+                Body=csv_buffer.getvalue(),
+                ContentType='text/csv'
+            )
+
+            print(f"Created: {output_key}")
+
+        return {
+            'statusCode': 200,
+            'body': f"Successfully split into {len(categories)} files"
+        }
+
+    except Exception as e:
+        print(str(e))
+        return {
+            'statusCode': 500,
+            'body': str(e)
+        }
