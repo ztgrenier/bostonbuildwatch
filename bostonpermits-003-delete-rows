@@ -13,8 +13,8 @@ def lambda_handler(event, context):
 
     s3 = boto3.client('s3')
 
-    # Cutoff date: 5 years ago
-    cutoff_date = datetime.now() - timedelta(days=5*365)
+    # Cutoff date: 3 years ago
+    cutoff_date = datetime.now() - timedelta(days=3*365)
 
     # --- Find most recent dated file in folder ---
     paginator = s3.get_paginator('list_objects_v2')
@@ -89,7 +89,7 @@ def lambda_handler(event, context):
     return {
         'statusCode': 200,
         'body': (
-            f'Deleted {deleted_rows} rows older than 5 years. '
+            f'Deleted {deleted_rows} rows older than 3 years. '
             f'Kept {total_rows - deleted_rows} rows. '
             f'File: {file_key}'
         )
