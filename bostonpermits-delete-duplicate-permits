@@ -1,0 +1,90 @@
+import boto3
+import csv
+import io
+import re
+from datetime import datetime
+
+s3 = boto3.client('s3')
+
+BUCKET = 'boston-buildwatch'
+PREFIX = 'boston-approved-building-permits/'
+
+def extract_date_from_filename(key):
+    """
+    Extract date from filename like:
+    Boston Buildwatch - Boston - 2026-04-24 - Approved Building Permits.csv
+    """
+    match = re.search(r'(\d{4}-\d{2}-\d{2})', key)
+    if match:
+        return datetime.strptime(match.group(1), '%Y-%m-%d')
+    return None
+
+def get_latest_file():
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+    
+    latest_key = None
+    latest_date = None
+    
+    for obj in response.get('Contents', []):
+        key = obj['Key']
+        
+        if not key.endswith('.csv'):
+            continue
+        
+        file_date = extract_date_from_filename(key)
+        if not file_date:
+            continue
+        
+        if latest_date is None or file_date > latest_date:
+            latest_date = file_date
+            latest_key = key
+    
+    return latest_key
+
+def lambda_handler(event, context):
+    latest_file_key = get_latest_file()
+    
+    if not latest_file_key:
+        print("No valid CSV files found.")
+        return
+    
+    print(f"Processing file: {latest_file_key}")
+    
+    # Read file from S3
+    response = s3.get_object(Bucket=BUCKET, Key=latest_file_key)
+    csv_content = response['Body'].read().decode('utf-8')
+    
+    reader = csv.DictReader(io.StringIO(csv_content))
+    
+    seen_hashes = set()
+    unique_rows = []
+    
+    for row in reader:
+        hash_value = row.get('Hash')
+        
+        if not hash_value:
+            continue
+        
+        if hash_value not in seen_hashes:
+            seen_hashes.add(hash_value)
+            unique_rows.append(row)
+    
+    print(f"Original rows: {len(list(csv.DictReader(io.StringIO(csv_content))))}")
+    print(f"Unique rows: {len(unique_rows)}")
+    
+    # Write cleaned CSV back to memory
+    output_buffer = io.StringIO()
+    writer = csv.DictWriter(output_buffer, fieldnames=reader.fieldnames)
+    
+    writer.writeheader()
+    writer.writerows(unique_rows)
+    
+    # Upload back to S3 (overwrite)
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=latest_file_key,
+        Body=output_buffer.getvalue(),
+        ContentType='text/csv'
+    )
+    
+    print("File cleaned and uploaded successfully.")
