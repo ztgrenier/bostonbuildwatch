@@ -1,0 +1,173 @@
+import boto3
+import pandas as pd
+import io
+import re
+
+s3 = boto3.client('s3')
+
+BUCKET = 'boston-buildwatch'
+REQ_PREFIX = 'boston-code-enforcement-dpw-violations/'
+GIS_PREFIX = 'boston-gis-data/'
+
+# ----------------------------
+# Normalization Functions
+# ----------------------------
+def normalize(val):
+    if pd.isna(val):
+        return ''
+    return str(val).strip().upper()
+
+def normalize_zip(val):
+    val = normalize(val)
+    val = re.sub(r'\D', '', val)  # remove non-numeric
+    return val.zfill(5)[:5]
+
+def normalize_suffix(val):
+    val = normalize(val)
+
+    mapping = {
+        'STREET': 'ST', 'ST': 'ST',
+        'AVENUE': 'AVE', 'AVE': 'AVE',
+        'ROAD': 'RD', 'RD': 'RD',
+        'BOULEVARD': 'BLVD', 'BLVD': 'BLVD',
+        'DRIVE': 'DR', 'DR': 'DR',
+        'LANE': 'LN', 'LN': 'LN',
+        'COURT': 'CT', 'CT': 'CT',
+        'PLACE': 'PL', 'PL': 'PL',
+        'SQUARE': 'SQ', 'SQ': 'SQ'
+    }
+
+    return mapping.get(val, val)
+
+def clean_street_name(val):
+    val = normalize(val)
+    val = re.sub(r'[^A-Z0-9 ]', '', val)  # remove punctuation
+    return re.sub(r'\s+', ' ', val).strip()
+
+def clean_street_number(val):
+    val = normalize(val)
+    val = re.sub(r'[^0-9]', '', val)  # remove letters like 123A
+    return val.lstrip('0')  # remove leading zeros
+
+# ----------------------------
+# Get Latest File
+# ----------------------------
+def get_latest_file(prefix):
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+
+    if 'Contents' not in response:
+        return None
+
+    files = [
+        obj for obj in response['Contents']
+        if obj['Key'].lower().endswith('.csv')
+    ]
+
+    if not files:
+        return None
+
+    latest = max(files, key=lambda x: x['LastModified'])
+    return latest['Key']
+
+# ----------------------------
+# Create Keys
+# ----------------------------
+def create_keys(df):
+    df['FULL_STREET'] = (df['Street Name'] + ' ' + df['Street Suffix']).str.strip()
+
+    df['KEY_1'] = df['Street Number'] + '|' + df['FULL_STREET'] + '|' + df['Zip']
+    df['KEY_2'] = df['Street Number'] + '|' + df['Street Name'] + '|' + df['Zip']
+    df['KEY_3'] = df['Street Number'] + '|' + df['FULL_STREET']
+
+    return df
+
+# ----------------------------
+# Lambda Handler
+# ----------------------------
+def lambda_handler(event, context):
+
+    # --- Load files ---
+    req_key = get_latest_file(REQ_PREFIX)
+    gis_key = get_latest_file(GIS_PREFIX)
+
+    if not req_key or not gis_key:
+        raise Exception("Missing files")
+
+    print(f"311 File: {req_key}")
+    print(f"GIS File: {gis_key}")
+
+    df_311 = pd.read_csv(io.BytesIO(s3.get_object(Bucket=BUCKET, Key=req_key)['Body'].read()), dtype=str)
+    df_gis = pd.read_csv(io.BytesIO(s3.get_object(Bucket=BUCKET, Key=gis_key)['Body'].read()), dtype=str)
+
+    # --- Normalize columns ---
+    cols = ['Street Number', 'Street Name', 'Street Suffix', 'Zip']
+
+    for col in cols:
+        df_311[col] = df_311[col].apply(normalize)
+        df_gis[col] = df_gis[col].apply(normalize)
+
+    df_311['Street Name'] = df_311['Street Name'].apply(clean_street_name)
+    df_gis['Street Name'] = df_gis['Street Name'].apply(clean_street_name)
+
+    df_311['Street Number'] = df_311['Street Number'].apply(clean_street_number)
+    df_gis['Street Number'] = df_gis['Street Number'].apply(clean_street_number)
+
+    df_311['Street Suffix'] = df_311['Street Suffix'].apply(normalize_suffix)
+    df_gis['Street Suffix'] = df_gis['Street Suffix'].apply(normalize_suffix)
+
+    df_311['Zip'] = df_311['Zip'].apply(normalize_zip)
+    df_gis['Zip'] = df_gis['Zip'].apply(normalize_zip)
+
+    # --- Create keys ---
+    df_311 = create_keys(df_311)
+    df_gis = create_keys(df_gis)
+
+    # --- Debug samples ---
+    print("\n--- SAMPLE 311 KEYS ---")
+    print(df_311[['KEY_1','KEY_2','KEY_3']].head(5))
+
+    print("\n--- SAMPLE GIS KEYS ---")
+    print(df_gis[['KEY_1','KEY_2','KEY_3']].head(5))
+
+    # --- Matching ---
+    df_311['Parcel ID'] = None
+
+    for key_col in ['KEY_1', 'KEY_2', 'KEY_3']:
+        lookup = dict(zip(df_gis[key_col], df_gis['Parcel ID']))
+
+        matches_before = df_311['Parcel ID'].notna().sum()
+
+        df_311['Parcel ID'] = df_311['Parcel ID'].fillna(df_311[key_col].map(lookup))
+
+        matches_after = df_311['Parcel ID'].notna().sum()
+
+        print(f"\nMatches using {key_col}: {matches_after - matches_before}")
+
+    # --- Final stats ---
+    total_matches = df_311['Parcel ID'].notna().sum()
+    total_rows = len(df_311)
+
+    print(f"\nFINAL MATCH RATE: {total_matches} / {total_rows}")
+
+    # --- Show unmatched examples ---
+    unmatched = df_311[df_311['Parcel ID'].isna()].head(10)
+    print("\n--- UNMATCHED EXAMPLES ---")
+    print(unmatched[['Street Number','Street Name','Street Suffix','Zip']])
+
+    # --- Cleanup ---
+    df_311.drop(columns=['KEY_1','KEY_2','KEY_3','FULL_STREET'], inplace=True)
+
+    # --- Save ---
+    csv_buffer = io.StringIO()
+    df_311.to_csv(csv_buffer, index=False)
+
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=req_key,
+        Body=csv_buffer.getvalue()
+    )
+
+    return {
+        'statusCode': 200,
+        'body': f'Matched {total_matches} of {total_rows}'
+    }
