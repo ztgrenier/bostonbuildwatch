@@ -1,0 +1,68 @@
+import boto3
+import csv
+import io
+import math
+import os
+
+s3 = boto3.client('s3')
+
+def lambda_handler(event, context):
+    # ===== CONFIG =====
+    SOURCE_BUCKET = "boston-buildwatch"
+    SOURCE_KEY = "boston-building-and-property-violations/Boston Buildwatch - Boston - 2026-04-13 - Building and Property Violations.csv"  # <-- change file name only
+    
+    CHUNK_SIZE = 2500
+    START_ROW = 1  # 1 = skip header, start at row 2
+    # ==================
+    
+    # Extract folder + base filename
+    folder = os.path.dirname(SOURCE_KEY)
+    filename = os.path.basename(SOURCE_KEY)
+    base_name = os.path.splitext(filename)[0]
+    
+    # Get file from S3 (read only)
+    response = s3.get_object(Bucket=SOURCE_BUCKET, Key=SOURCE_KEY)
+    content = response['Body'].read().decode('utf-8')
+    
+    reader = list(csv.reader(io.StringIO(content)))
+    
+    header = reader[0]
+    data_rows = reader[START_ROW:]
+    
+    total_rows = len(data_rows)
+    num_chunks = math.ceil(total_rows / CHUNK_SIZE)
+    
+    print(f"Total rows: {total_rows}, Chunks: {num_chunks}")
+    
+    for i in range(num_chunks):
+        start = i * CHUNK_SIZE
+        end = start + CHUNK_SIZE
+        chunk_rows = data_rows[start:end]
+        
+        # Create CSV in memory
+        output_buffer = io.StringIO()
+        writer = csv.writer(output_buffer)
+        
+        # Write header + chunk
+        writer.writerow(header)
+        writer.writerows(chunk_rows)
+        
+        # Format chunk number (001, 002, etc.)
+        chunk_number = str(i + 1).zfill(3)
+        
+        # Output key (same folder)
+        output_key = f"{folder}/{base_name}-chunk-{chunk_number}.csv"
+        
+        # Upload (does NOT overwrite original)
+        s3.put_object(
+            Bucket=SOURCE_BUCKET,
+            Key=output_key,
+            Body=output_buffer.getvalue()
+        )
+        
+        print(f"Uploaded: {output_key}")
+    
+    return {
+        "statusCode": 200,
+        "body": f"Created {num_chunks} chunk files in boston-building-and-property-violations/"
+    }
