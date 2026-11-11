@@ -1,0 +1,138 @@
+import boto3
+import pandas as pd
+import re
+import io
+from datetime import datetime
+
+# -----------------------
+# CONFIG
+# -----------------------
+S3_BUCKET = "boston-buildwatch"
+S3_PREFIX = "boston-development/"
+FILENAME_REGEX = r"Boston Buildwatch - Boston - (\d{4}-\d{2}-\d{2}) - Boston Development\.csv"
+
+LAYOUT_PREFIX = "boston-development/"
+LAYOUT_FILENAME = "column order - boston development.csv"
+
+CHUNK_SIZE = 100_000  # rows per chunk
+
+# -----------------------
+# AWS CLIENT
+# -----------------------
+s3 = boto3.client("s3")
+
+
+def get_latest_csv_key():
+    response = s3.list_objects_v2(
+        Bucket=S3_BUCKET,
+        Prefix=S3_PREFIX
+    )
+
+    matches = []
+    for obj in response.get("Contents", []):
+        m = re.search(FILENAME_REGEX, obj["Key"])
+        if m:
+            matches.append(
+                (datetime.strptime(m.group(1), "%Y-%m-%d"), obj["Key"])
+            )
+
+    if not matches:
+        raise Exception("No matching dated CSV found")
+
+    matches.sort(reverse=True)
+    return matches[0][1]
+
+
+def load_layout():
+    key = f"{LAYOUT_PREFIX}{LAYOUT_FILENAME}"
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+
+    layout_df = pd.read_csv(io.BytesIO(obj["Body"].read()), dtype=str)
+
+    REQUIRED_COLS = [
+        "Current Column Names/ Layout",
+        "Desired Column Names/ Layout"
+    ]
+
+    for col in REQUIRED_COLS:
+        if col not in layout_df.columns:
+            raise Exception(f"Layout CSV missing required column: {col}")
+
+    rename_map = {}
+    final_columns = []
+
+    for _, row in layout_df.iterrows():
+        current = str(row[REQUIRED_COLS[0]]).strip() if pd.notna(row[REQUIRED_COLS[0]]) else ""
+        desired = str(row[REQUIRED_COLS[1]]).strip() if pd.notna(row[REQUIRED_COLS[1]]) else ""
+
+        if desired:
+            final_columns.append(desired)
+
+        if current and desired:
+            rename_map[current] = desired
+
+    return rename_map, final_columns
+
+
+def lambda_handler(event, context):
+    target_key = get_latest_csv_key()
+    rename_map, final_columns = load_layout()
+
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=target_key)
+    stream = io.BytesIO(obj["Body"].read())
+
+    output_buffer = io.StringIO()
+    first_chunk = True
+    total_rows = 0
+
+    added_columns = set()
+    renamed_columns = set(rename_map.values())
+    missing_expected = set()
+
+    for chunk in pd.read_csv(stream, dtype=str, chunksize=CHUNK_SIZE):
+        original_cols = set(chunk.columns)
+
+        # Rename
+        chunk.rename(columns=rename_map, inplace=True)
+
+        # Add missing columns
+        for col in final_columns:
+            if col not in chunk.columns:
+                chunk[col] = ""
+                added_columns.add(col)
+
+        # Detect expected-but-missing source columns
+        for src in rename_map.keys():
+            if src not in original_cols:
+                missing_expected.add(src)
+
+        # Reorder
+        chunk = chunk[final_columns]
+
+        chunk.to_csv(
+            output_buffer,
+            index=False,
+            header=first_chunk
+        )
+
+        first_chunk = False
+        total_rows += len(chunk)
+
+    # Save back to S3 (overwrite original)
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=target_key,
+        Body=output_buffer.getvalue()
+    )
+
+    return {
+        "statusCode": 200,
+        "body": {
+            "file_processed": target_key,
+            "rows_processed": total_rows,
+            "final_column_count": len(final_columns),
+            "renamed_columns": sorted(list(renamed_columns)),
+            "added_columns": sorted(list(added_columns)),
+            "missing_expected_source_columns": sorted(list(missing_expected))
+        }
+    }
