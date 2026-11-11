@@ -1,0 +1,107 @@
+import boto3
+import csv
+import hashlib
+import io
+import re
+from datetime import datetime
+
+s3 = boto3.client('s3')
+
+BUCKET_NAME = "boston-buildwatch"
+
+FILENAME_PATTERN = re.compile(
+    r'(Boston Buildwatch - Boston - (\d{4}-\d{2}-\d{2}) - 311 Requests)\.csv'
+)
+
+def lambda_handler(event, context):
+    # -----------------------------
+    # STEP 1: Find newest file
+    # -----------------------------
+    response = s3.list_objects_v2(Bucket=BUCKET_NAME)
+
+    latest_file = None
+    latest_date = None
+
+    for obj in response.get('Contents', []):
+        key = obj['Key']
+        match = FILENAME_PATTERN.search(key)
+
+        if match:
+            file_date = datetime.strptime(match.group(2), "%Y-%m-%d")
+
+            if not latest_date or file_date > latest_date:
+                latest_date = file_date
+                latest_file = key
+
+    if not latest_file:
+        print("No matching file found")
+        return {"status": "No matching file found"}
+
+    print(f"Found latest file: {latest_file}")
+
+    # ✅ Overwrite same file
+    output_key = latest_file
+
+    # -----------------------------
+    # STEP 2: Download file
+    # -----------------------------
+    obj = s3.get_object(Bucket=BUCKET_NAME, Key=latest_file)
+    input_stream = io.TextIOWrapper(obj['Body'], encoding='utf-8')
+    reader = csv.reader(input_stream)
+
+    output_path = "/tmp/output.csv"
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        # -----------------------------
+        # STEP 3: Read + validate header
+        # -----------------------------
+        header = next(reader)
+        header = [col.strip() for col in header]
+
+        if "Hash" not in header:
+            raise Exception("Expected 'Hash' column not found in CSV")
+
+        hash_index = header.index("Hash")
+
+        writer.writerow(header)
+
+        # -----------------------------
+        # STEP 4: Process rows
+        # -----------------------------
+        for row in reader:
+            # Ensure row matches header length
+            if len(row) < len(header):
+                row += [""] * (len(header) - len(row))
+            elif len(row) > len(header):
+                row = row[:len(header)]
+
+            # Create hash WITHOUT existing Hash value
+            row_for_hash = row.copy()
+            row_for_hash[hash_index] = ""
+
+            row_hash = hashlib.md5("|".join(row_for_hash).encode("utf-8")).hexdigest()
+
+            row[hash_index] = row_hash
+
+            writer.writerow(row)
+
+    print("Finished writing temp file")
+
+    # -----------------------------
+    # STEP 5: Upload (overwrite)
+    # -----------------------------
+    with open(output_path, "rb") as f:
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=output_key,
+            Body=f
+        )
+
+    print("Overwrite complete")
+
+    return {
+        "status": "Success",
+        "file_updated": output_key
+    }
