@@ -1,0 +1,144 @@
+import boto3
+import pandas as pd
+import io
+
+s3 = boto3.client('s3')
+
+BUCKET = 'boston-buildwatch'
+REQ_PREFIX = 'boston-after-hours-construction/'
+GIS_PREFIX = 'boston-gis-data/'
+
+# ----------------------------
+# Normalization Functions
+# ----------------------------
+def normalize(val):
+    if pd.isna(val):
+        return ''
+    return str(val).strip().upper()
+
+def normalize_zip(val):
+    val = normalize(val)
+    return val.zfill(5)[:5]
+
+def normalize_suffix(val):
+    val = normalize(val)
+
+    mapping = {
+        'STREET': 'ST', 'ST': 'ST',
+        'AVENUE': 'AVE', 'AVE': 'AVE',
+        'ROAD': 'RD', 'RD': 'RD',
+        'BOULEVARD': 'BLVD', 'BLVD': 'BLVD',
+        'DRIVE': 'DR', 'DR': 'DR',
+        'LANE': 'LN', 'LN': 'LN',
+        'COURT': 'CT', 'CT': 'CT',
+        'PLACE': 'PL', 'PL': 'PL',
+        'SQUARE': 'SQ', 'SQ': 'SQ'
+    }
+
+    return mapping.get(val, val)
+
+# ----------------------------
+# Get Latest File
+# ----------------------------
+def get_latest_file(prefix):
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+
+    if 'Contents' not in response:
+        print(f"No objects found at prefix: {prefix}")
+        return None
+
+    files = [
+        obj for obj in response['Contents']
+        if obj['Key'].lower().endswith('.csv')
+    ]
+
+    if not files:
+        print(f"No CSV files found in {prefix}")
+        return None
+
+    latest = max(files, key=lambda x: x['LastModified'])
+    return latest['Key']
+
+# ----------------------------
+# Create Matching Key
+# ----------------------------
+def make_key(df):
+    return (
+        df['Street Number'] + '|' +
+        df['Street Name'] + '|' +
+        df['Street Suffix'] + '|' +
+        df['Zip']
+    )
+
+# ----------------------------
+# Lambda Handler
+# ----------------------------
+def lambda_handler(event, context):
+
+    # --- Get latest 311 file ---
+    latest_311_key = get_latest_file(REQ_PREFIX)
+    if not latest_311_key:
+        raise Exception(f"No CSV found in {REQ_PREFIX}")
+
+    print(f"Latest 311 file: {latest_311_key}")
+
+    # --- Get GIS file ---
+    gis_key = get_latest_file(GIS_PREFIX)
+    if not gis_key:
+        raise Exception(f"No CSV found in {GIS_PREFIX}")
+
+    print(f"GIS file: {gis_key}")
+
+    # --- Load CSVs ---
+    obj_311 = s3.get_object(Bucket=BUCKET, Key=latest_311_key)
+    df_311 = pd.read_csv(io.BytesIO(obj_311['Body'].read()), dtype=str)
+
+    obj_gis = s3.get_object(Bucket=BUCKET, Key=gis_key)
+    df_gis = pd.read_csv(io.BytesIO(obj_gis['Body'].read()), dtype=str)
+
+    # --- Normalize columns ---
+    cols = ['Street Number', 'Street Name', 'Street Suffix', 'Zip']
+
+    for col in cols:
+        df_311[col] = df_311[col].apply(normalize)
+        df_gis[col] = df_gis[col].apply(normalize)
+
+    # --- Apply specific normalizations ---
+    df_311['Street Suffix'] = df_311['Street Suffix'].apply(normalize_suffix)
+    df_gis['Street Suffix'] = df_gis['Street Suffix'].apply(normalize_suffix)
+
+    df_311['Zip'] = df_311['Zip'].apply(normalize_zip)
+    df_gis['Zip'] = df_gis['Zip'].apply(normalize_zip)
+
+    # --- Create matching keys ---
+    df_311['MATCH_KEY'] = make_key(df_311)
+    df_gis['MATCH_KEY'] = make_key(df_gis)
+
+    # --- Build lookup dictionary ---
+    gis_lookup = dict(zip(df_gis['MATCH_KEY'], df_gis['Parcel ID']))
+
+    # --- Map Parcel IDs ---
+    df_311['Parcel ID'] = df_311['MATCH_KEY'].map(gis_lookup)
+
+    # --- Debug match rate ---
+    matches = df_311['Parcel ID'].notna().sum()
+    total = len(df_311)
+    print(f"Matches: {matches} / {total}")
+
+    # --- Cleanup ---
+    df_311.drop(columns=['MATCH_KEY'], inplace=True)
+
+    # --- Save back to S3 (overwrite same file) ---
+    csv_buffer = io.StringIO()
+    df_311.to_csv(csv_buffer, index=False)
+
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=latest_311_key,
+        Body=csv_buffer.getvalue()
+    )
+
+    return {
+        'statusCode': 200,
+        'body': f'Updated {latest_311_key} with Parcel IDs ({matches}/{total} matched)'
+    }
