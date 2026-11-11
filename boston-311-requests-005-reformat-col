@@ -1,0 +1,115 @@
+import json
+import re
+import boto3
+import pandas as pd
+from datetime import datetime
+from botocore.exceptions import ClientError
+
+# -----------------------
+# CONFIG
+# -----------------------
+S3_BUCKET = "boston-buildwatch"
+S3_PREFIX = "boston-311-requests/"
+FILENAME_REGEX = r"Boston Buildwatch - Boston - (\d{4}-\d{2}-\d{2}) - 311 Requests\.csv"
+
+s3_client = boto3.client('s3')
+
+def lambda_handler(event, context):
+    try:
+        # Find matching files
+        response = s3_client.list_objects_v2(
+            Bucket=S3_BUCKET,
+            Prefix=S3_PREFIX
+        )
+
+        if 'Contents' not in response:
+            print("No files found in bucket/prefix")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({'message': 'No files found'})
+            }
+
+        candidates = []
+        pattern = re.compile(FILENAME_REGEX)
+
+        for obj in response['Contents']:
+            key = obj['Key']
+            match = pattern.search(key)
+            if match:
+                date_str = match.group(1)
+                try:
+                    file_date = datetime.strptime(date_str, '%Y-%m-%d')
+                    candidates.append((file_date, key))
+                except ValueError:
+                    continue
+
+        if not candidates:
+            print("No files matched the regex pattern")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({'message': 'No matching files found'})
+            }
+
+        # Take most recent file
+        candidates.sort(reverse=True)  # newest first
+        _, input_key = candidates[0]
+        print(f"Processing file (will overwrite): {input_key}")
+
+        # Download file from S3
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=input_key)
+        df = pd.read_csv(obj['Body'])
+
+        # ────────────────────────────────────────────────
+        # Transformations
+        # ────────────────────────────────────────────────
+
+        # 1. Case Enquiry ID → integer (no decimal, Int64 handles NaN)
+        if 'Case Enquiry ID' in df.columns:
+            df['Case Enquiry ID'] = pd.to_numeric(df['Case Enquiry ID'], errors='coerce')
+            df['Case Enquiry ID'] = df['Case Enquiry ID'].astype('Int64')
+
+        # 2. Date columns → mm/dd/yyyy HH:MM (24-hour)
+        date_cols = [
+            'Open Date/ Time',
+            'Target Close Date - Based on Service Level Agreement',
+            'Closed Date/ Time'
+        ]
+
+        for col in date_cols:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+                df[col] = df[col].dt.strftime('%m/%d/%Y %H:%M')
+
+        # 3. Replace &amp; → & in Location
+        if 'Location' in df.columns:
+            df['Location'] = df['Location'].astype(str).str.replace('&amp;', '&', regex=False)
+
+        # ────────────────────────────────────────────────
+        # Overwrite original file
+        # ────────────────────────────────────────────────
+        csv_buffer = df.to_csv(index=False, encoding='utf-8')
+
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=input_key,               # ← same key = overwrite
+            Body=csv_buffer,
+            ContentType='text/csv'
+        )
+
+        print(f"Successfully processed and overwrote: {input_key}")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'File cleaned and overwritten in place',
+                'file': input_key,
+                'row_count': len(df)
+            })
+        }
+
+    except ClientError as e:
+        print(f"AWS error: {e}")
+        return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
