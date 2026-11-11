@@ -1,0 +1,137 @@
+import boto3
+import pandas as pd
+import io
+import re
+
+s3 = boto3.client('s3')
+
+BUCKET_NAME = 'boston-buildwatch'
+FOLDER = 'boston-311-requests/'
+
+
+def get_latest_csv():
+    response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix=FOLDER)
+    if 'Contents' not in response:
+        return None
+
+    csv_files = [
+        obj for obj in response['Contents']
+        if '311 Requests.csv' in obj['Key']
+    ]
+
+    if not csv_files:
+        return None
+
+    csv_files = sorted(csv_files, key=lambda x: x['LastModified'], reverse=True)
+    return csv_files[0]['Key']
+
+
+def parse_address(address):
+    if not address or 'INTERSECTION' in str(address).upper():
+        return None
+
+    address = re.sub(r'\s+', ' ', address.strip())
+
+    # ZIP → City mapping
+    zip_to_city = {
+        '02108': 'Boston', '02109': 'Boston', '02110': 'Boston', '02111': 'Boston',
+        '02113': 'Boston', '02114': 'Boston', '02115': 'Boston', '02116': 'Boston',
+        '02118': 'Roxbury', '02119': 'Roxbury', '02120': 'Roxbury',
+        '02121': 'Dorchester', '02122': 'Dorchester', '02124': 'Dorchester', '02125': 'Dorchester',
+        '02126': 'Mattapan',
+        '02127': 'South Boston',
+        '02128': 'East Boston',
+        '02129': 'Charlestown',
+        '02130': 'Jamaica Plain',
+        '02131': 'Roslindale',
+        '02132': 'West Roxbury',
+        '02134': 'Allston',
+        '02135': 'Brighton',
+        '02136': 'Hyde Park',
+        '02199': 'Boston',
+        '02210': 'Boston',
+        '02215': 'Boston'
+    }
+
+    # Extract ZIP
+    zip_match = re.search(r'\b\d{5}\b', address)
+    if not zip_match:
+        return None
+
+    zip_code = zip_match.group()
+    city = zip_to_city.get(zip_code)
+
+    state = 'MA'
+
+    # Clean string
+    address_clean = address.replace(zip_code, '')
+    address_clean = address_clean.replace('MA', '')
+    address_clean = address_clean.strip()
+
+    # Remove city if present
+    if city and city in address_clean:
+        address_clean = address_clean.replace(city, '').strip()
+
+    parts = address_clean.split(' ')
+    if len(parts) < 2:
+        return None
+
+    street_number = parts[0]
+    street_suffix = parts[-1]
+    street_name = ' '.join(parts[1:-1]) if len(parts) > 2 else ''
+
+    return {
+        'Street Number': street_number,
+        'Street Name': street_name,
+        'Street Suffix': street_suffix,
+        'City': city,
+        'State': state,
+        'Zip': zip_code
+    }
+
+
+def lambda_handler(event, context):
+    latest_csv_key = get_latest_csv()
+    if not latest_csv_key:
+        return {'status': 'No CSV found'}
+
+    obj = s3.get_object(Bucket=BUCKET_NAME, Key=latest_csv_key)
+    df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+
+    # Clean column names
+    df.columns = df.columns.str.strip()
+
+    if 'Location' not in df.columns:
+        return {'status': 'Location column not found'}
+
+    target_cols = ['Street Number', 'Street Name', 'Street Suffix', 'City', 'State', 'Zip']
+
+    # ✅ Ensure columns exist + correct dtype
+    for col in target_cols:
+        if col not in df.columns:
+            df[col] = None
+        df[col] = df[col].astype('string')
+
+    # 🚀 Process rows
+    for i, val in df['Location'].items():
+        parsed = parse_address(str(val))
+        if parsed:
+            for key in target_cols:
+                if key in parsed:
+                    df.at[i, key] = str(parsed[key]) if parsed[key] is not None else None
+
+    # Save back to S3
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=latest_csv_key,
+        Body=csv_buffer.getvalue()
+    )
+
+    return {
+        'status': 'Success',
+        'file': latest_csv_key,
+        'rows_processed': len(df)
+    }
